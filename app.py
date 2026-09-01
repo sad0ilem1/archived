@@ -3,32 +3,32 @@ import time
 import threading
 import traceback
 from datetime import datetime, timezone
- 
+
 import requests
 from flask import Flask, jsonify, request
-from supabase import create_client, Client
- 
+from supabase import create_client, Client, ClientOptions
+
+
 TABLE_NAME = "table_top"
 ID_COLUMN = "id"
 DELETED_AT_COLUMN = "deleted_at"
- 
+
+
 OVERWRITE_EXISTING_DELETED_AT = False
- 
+
 SUPABASE_SELECT_BATCH_SIZE = 500
 SUPABASE_UPSERT_BATCH_SIZE = 500
 SUPABASE_TIMEOUT_SECONDS = 30 
- 
+
 REQUEST_DELAY = 0.2
- 
+
 
 TRAVA_STALE_SEGUNDOS = 15 * 60  
- 
+
 CLICKUP_VIEW_URL = "https://api.clickup.com/api/v2/view/{view_id}/task"
- 
-# ==================================================================
- 
+
 app = Flask(__name__)
- 
+
 
 ultimo_status = {
     "estado": "nunca_executado", 
@@ -38,44 +38,44 @@ ultimo_status = {
     "erro": None,
 }
 lock_status = threading.Lock()
- 
- 
+
+
 def epoch_ms_para_iso(epoch_ms_str):
     epoch_ms = int(epoch_ms_str)
     return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).isoformat()
- 
- 
+
+
 def buscar_todas_tarefas_da_view(view_id, headers):
     tarefas = []
     page = 0
- 
+
     while True:
         url = CLICKUP_VIEW_URL.format(view_id=view_id)
         resp = requests.get(url, headers=headers, params={"page": page}, timeout=30)
- 
+
         if resp.status_code != 200:
             raise RuntimeError(
                 f"Erro ao consultar a view (page={page}): "
                 f"status {resp.status_code} - {resp.text}"
             )
- 
+
         data = resp.json()
         tasks_da_pagina = data.get("tasks", [])
- 
+
         for t in tasks_da_pagina:
             tarefas.append({"id": t.get("id"), "date_updated": t.get("date_updated")})
- 
+
         print(f"[sync] página {page}: {len(tasks_da_pagina)} tarefas (acumulado: {len(tarefas)})", flush=True)
- 
+
         if data.get("last_page", True) or not tasks_da_pagina:
             break
- 
+
         page += 1
         time.sleep(REQUEST_DELAY)
- 
+
     return tarefas
- 
- 
+
+
 def buscar_ids_existentes_no_banco(supabase: Client, ids):
     existentes = {}
     total_lotes = (len(ids) + SUPABASE_SELECT_BATCH_SIZE - 1) // SUPABASE_SELECT_BATCH_SIZE
@@ -91,13 +91,13 @@ def buscar_ids_existentes_no_banco(supabase: Client, ids):
         for row in resultado.data:
             existentes[row[ID_COLUMN]] = row.get(DELETED_AT_COLUMN)
     return existentes
- 
- 
+
+
 def atualizar_deleted_at_em_lote(supabase: Client, registros):
     ids_com_sucesso = []
     erros = []
     total_lotes = (len(registros) + SUPABASE_UPSERT_BATCH_SIZE - 1) // SUPABASE_UPSERT_BATCH_SIZE
- 
+
     for idx, i in enumerate(range(0, len(registros), SUPABASE_UPSERT_BATCH_SIZE), start=1):
         lote = registros[i:i + SUPABASE_UPSERT_BATCH_SIZE]
         print(f"[sync] atualizando lote {idx}/{total_lotes} ({len(lote)} registros)", flush=True)
@@ -117,57 +117,57 @@ def atualizar_deleted_at_em_lote(supabase: Client, registros):
                     ids_com_sucesso.append(r[ID_COLUMN])
                 except Exception as e2:
                     erros.append({"id": r[ID_COLUMN], "motivo": str(e2)})
- 
+
     return ids_com_sucesso, erros
- 
- 
+
+
 def executar_sincronizacao():
     clickup_token = os.environ["CLICKUP_API_TOKEN"]
     view_id = os.environ["CLICKUP_VIEW_ID"]
     supabase_url = os.environ["SUPABASE_URL"]
     supabase_key = os.environ["SUPABASE_SERVICE_KEY"]
- 
+
     headers = {"Authorization": clickup_token, "accept": "application/json"}
     supabase: Client = create_client(
         supabase_url,
         supabase_key,
         options=ClientOptions(postgrest_client_timeout=SUPABASE_TIMEOUT_SECONDS),
     )
- 
+
     print("[sync] buscando tarefas da view do ClickUp...", flush=True)
     tarefas = buscar_todas_tarefas_da_view(view_id, headers)
     print(f"[sync] total de tarefas na view: {len(tarefas)}", flush=True)
- 
+
     tarefas_validas = [t for t in tarefas if t.get("id") and t.get("date_updated")]
     ids_view = [t["id"] for t in tarefas_validas]
- 
+
     if not ids_view:
         return {"tarefas_na_view": 0, "atualizados": 0, "pulados": 0, "erros": 0}
- 
+
     print("[sync] consultando quais ids existem no banco...", flush=True)
     existentes_no_banco = buscar_ids_existentes_no_banco(supabase, ids_view)
     print(f"[sync] ids encontrados no banco: {len(existentes_no_banco)}", flush=True)
- 
+
     pulados = 0
     registros_para_atualizar = []
- 
+
     for t in tarefas_validas:
         if t["id"] not in existentes_no_banco:
             continue
- 
+
         deleted_at_atual = existentes_no_banco[t["id"]]
         if deleted_at_atual and not OVERWRITE_EXISTING_DELETED_AT:
             pulados += 1
             continue
- 
+
         registros_para_atualizar.append({
             ID_COLUMN: t["id"],
             DELETED_AT_COLUMN: epoch_ms_para_iso(t["date_updated"]),
         })
- 
+
     print(f"[sync] atualizando {len(registros_para_atualizar)} registros...", flush=True)
     atualizados, erros = atualizar_deleted_at_em_lote(supabase, registros_para_atualizar)
- 
+
     return {
         "tarefas_na_view": len(tarefas),
         "encontrados_no_banco": len(existentes_no_banco),
@@ -176,8 +176,8 @@ def executar_sincronizacao():
         "erros": len(erros),
         "detalhe_erros": erros,
     }
- 
- 
+
+
 def rodar_sincronizacao_em_background():
     with lock_status:
         ultimo_status["estado"] = "rodando"
@@ -185,7 +185,7 @@ def rodar_sincronizacao_em_background():
         ultimo_status["finalizado_em"] = None
         ultimo_status["resumo"] = None
         ultimo_status["erro"] = None
- 
+
     try:
         resumo = executar_sincronizacao()
         with lock_status:
@@ -200,25 +200,25 @@ def rodar_sincronizacao_em_background():
             ultimo_status["finalizado_em"] = datetime.now(timezone.utc).isoformat()
             ultimo_status["erro"] = str(e)
         print(f"[sync] ERRO: {erro_texto}")
- 
- 
+
+
 @app.route("/")
 def health():
     return "ok"
- 
- 
+
+
 @app.route("/sync")
 def sync():
     chave_esperada = os.environ.get("SYNC_SECRET_KEY")
     chave_recebida = request.args.get("key")
- 
+
     if not chave_esperada or chave_recebida != chave_esperada:
         return jsonify({"erro": "não autorizado"}), 401
- 
+
     with lock_status:
         ja_rodando = ultimo_status["estado"] == "rodando"
         preso_ha_muito_tempo = False
- 
+
         if ja_rodando and ultimo_status["iniciado_em"]:
             iniciado_em = datetime.fromisoformat(ultimo_status["iniciado_em"])
             segundos_rodando = (datetime.now(timezone.utc) - iniciado_em).total_seconds()
@@ -229,36 +229,36 @@ def sync():
                     f"(> {TRAVA_STALE_SEGUNDOS}s) -- considerando travado e destravando.",
                     flush=True,
                 )
- 
+
     if ja_rodando and not preso_ha_muito_tempo:
         
         return jsonify({
             "mensagem": "Já existe uma sincronização em andamento, ignorando esse disparo.",
             "status": ultimo_status,
         }), 202
- 
+
     thread = threading.Thread(target=rodar_sincronizacao_em_background, daemon=True)
     thread.start()
- 
+
     
     return jsonify({
         "mensagem": "Sincronização iniciada em segundo plano.",
         "dica": "Consulte /status?key=SUA_CHAVE para ver o andamento/resultado.",
     }), 202
- 
- 
+
+
 @app.route("/status")
 def status():
     chave_esperada = os.environ.get("SYNC_SECRET_KEY")
     chave_recebida = request.args.get("key")
- 
+
     if not chave_esperada or chave_recebida != chave_esperada:
         return jsonify({"erro": "não autorizado"}), 401
- 
+
     with lock_status:
         return jsonify(ultimo_status), 200
- 
- 
-if __name__ == "__main__":  
+
+
+if __name__ == "__main__":
+    
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
- 
