@@ -8,8 +8,8 @@ import requests
 from flask import Flask, jsonify, request
 from supabase import create_client, Client
  
-TABLE_NAME = "tasks"
-ID_COLUMN = "clickup_id"
+TABLE_NAME = "table_top"
+ID_COLUMN = "id"
 DELETED_AT_COLUMN = "deleted_at"
  
 OVERWRITE_EXISTING_DELETED_AT = False
