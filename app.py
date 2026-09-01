@@ -16,17 +16,22 @@ OVERWRITE_EXISTING_DELETED_AT = False
  
 SUPABASE_SELECT_BATCH_SIZE = 500
 SUPABASE_UPSERT_BATCH_SIZE = 500
+SUPABASE_TIMEOUT_SECONDS = 30 
  
-REQUEST_DELAY = 0.2  
+REQUEST_DELAY = 0.2
+ 
+
+TRAVA_STALE_SEGUNDOS = 15 * 60  
  
 CLICKUP_VIEW_URL = "https://api.clickup.com/api/v2/view/{view_id}/task"
  
+# ==================================================================
  
 app = Flask(__name__)
  
 
 ultimo_status = {
-    "estado": "nunca_executado",  
+    "estado": "nunca_executado", 
     "iniciado_em": None,
     "finalizado_em": None,
     "resumo": None,
@@ -60,6 +65,8 @@ def buscar_todas_tarefas_da_view(view_id, headers):
         for t in tasks_da_pagina:
             tarefas.append({"id": t.get("id"), "date_updated": t.get("date_updated")})
  
+        print(f"[sync] página {page}: {len(tasks_da_pagina)} tarefas (acumulado: {len(tarefas)})", flush=True)
+ 
         if data.get("last_page", True) or not tasks_da_pagina:
             break
  
@@ -71,8 +78,10 @@ def buscar_todas_tarefas_da_view(view_id, headers):
  
 def buscar_ids_existentes_no_banco(supabase: Client, ids):
     existentes = {}
-    for i in range(0, len(ids), SUPABASE_SELECT_BATCH_SIZE):
+    total_lotes = (len(ids) + SUPABASE_SELECT_BATCH_SIZE - 1) // SUPABASE_SELECT_BATCH_SIZE
+    for idx, i in enumerate(range(0, len(ids), SUPABASE_SELECT_BATCH_SIZE), start=1):
         lote = ids[i:i + SUPABASE_SELECT_BATCH_SIZE]
+        print(f"[sync] consultando banco: lote {idx}/{total_lotes} ({len(lote)} ids)", flush=True)
         resultado = (
             supabase.table(TABLE_NAME)
             .select(f"{ID_COLUMN},{DELETED_AT_COLUMN}")
@@ -87,13 +96,16 @@ def buscar_ids_existentes_no_banco(supabase: Client, ids):
 def atualizar_deleted_at_em_lote(supabase: Client, registros):
     ids_com_sucesso = []
     erros = []
+    total_lotes = (len(registros) + SUPABASE_UPSERT_BATCH_SIZE - 1) // SUPABASE_UPSERT_BATCH_SIZE
  
-    for i in range(0, len(registros), SUPABASE_UPSERT_BATCH_SIZE):
+    for idx, i in enumerate(range(0, len(registros), SUPABASE_UPSERT_BATCH_SIZE), start=1):
         lote = registros[i:i + SUPABASE_UPSERT_BATCH_SIZE]
+        print(f"[sync] atualizando lote {idx}/{total_lotes} ({len(lote)} registros)", flush=True)
         try:
             supabase.table(TABLE_NAME).upsert(lote, on_conflict=ID_COLUMN).execute()
             ids_com_sucesso.extend([r[ID_COLUMN] for r in lote])
         except Exception as e:
+            print(f"[sync] lote {idx} falhou no upsert em massa ({e}), tentando um por um...", flush=True)
             for r in lote:
                 try:
                     (
@@ -116,16 +128,25 @@ def executar_sincronizacao():
     supabase_key = os.environ["SUPABASE_SERVICE_KEY"]
  
     headers = {"Authorization": clickup_token, "accept": "application/json"}
-    supabase: Client = create_client(supabase_url, supabase_key)
+    supabase: Client = create_client(
+        supabase_url,
+        supabase_key,
+        options=ClientOptions(postgrest_client_timeout=SUPABASE_TIMEOUT_SECONDS),
+    )
  
+    print("[sync] buscando tarefas da view do ClickUp...", flush=True)
     tarefas = buscar_todas_tarefas_da_view(view_id, headers)
+    print(f"[sync] total de tarefas na view: {len(tarefas)}", flush=True)
+ 
     tarefas_validas = [t for t in tarefas if t.get("id") and t.get("date_updated")]
     ids_view = [t["id"] for t in tarefas_validas]
  
     if not ids_view:
         return {"tarefas_na_view": 0, "atualizados": 0, "pulados": 0, "erros": 0}
  
+    print("[sync] consultando quais ids existem no banco...", flush=True)
     existentes_no_banco = buscar_ids_existentes_no_banco(supabase, ids_view)
+    print(f"[sync] ids encontrados no banco: {len(existentes_no_banco)}", flush=True)
  
     pulados = 0
     registros_para_atualizar = []
@@ -144,6 +165,7 @@ def executar_sincronizacao():
             DELETED_AT_COLUMN: epoch_ms_para_iso(t["date_updated"]),
         })
  
+    print(f"[sync] atualizando {len(registros_para_atualizar)} registros...", flush=True)
     atualizados, erros = atualizar_deleted_at_em_lote(supabase, registros_para_atualizar)
  
     return {
@@ -195,9 +217,21 @@ def sync():
  
     with lock_status:
         ja_rodando = ultimo_status["estado"] == "rodando"
+        preso_ha_muito_tempo = False
  
-    if ja_rodando:
-       
+        if ja_rodando and ultimo_status["iniciado_em"]:
+            iniciado_em = datetime.fromisoformat(ultimo_status["iniciado_em"])
+            segundos_rodando = (datetime.now(timezone.utc) - iniciado_em).total_seconds()
+            if segundos_rodando > TRAVA_STALE_SEGUNDOS:
+                preso_ha_muito_tempo = True
+                print(
+                    f"[sync] status estava 'rodando' há {int(segundos_rodando)}s "
+                    f"(> {TRAVA_STALE_SEGUNDOS}s) -- considerando travado e destravando.",
+                    flush=True,
+                )
+ 
+    if ja_rodando and not preso_ha_muito_tempo:
+        
         return jsonify({
             "mensagem": "Já existe uma sincronização em andamento, ignorando esse disparo.",
             "status": ultimo_status,
@@ -206,7 +240,7 @@ def sync():
     thread = threading.Thread(target=rodar_sincronizacao_em_background, daemon=True)
     thread.start()
  
-   
+    
     return jsonify({
         "mensagem": "Sincronização iniciada em segundo plano.",
         "dica": "Consulte /status?key=SUA_CHAVE para ver o andamento/resultado.",
@@ -225,6 +259,6 @@ def status():
         return jsonify(ultimo_status), 200
  
  
-if __name__ == "__main__":
-  
+if __name__ == "__main__":  
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+ 
